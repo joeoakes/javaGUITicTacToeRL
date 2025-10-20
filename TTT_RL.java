@@ -1,24 +1,22 @@
 import javax.swing.*;
 
-// Import only the AWT classes actually needed (no java.awt.*)
+// Import only the AWT classes we actually need (avoid java.awt.* to prevent List clash)
 import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Font;
 import java.awt.FlowLayout;
+import java.awt.GridLayout;
 import java.awt.event.*;
 
-// Import Java utility classes individually
 import java.io.*;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Random;
 
 /**
- * TTT_RL: Tic-Tac-Toe with a tabular Q-learning agent (O) vs human (X).
- * - Click cells to play as X.
- * - "Train 50k" runs 50,000 self-play episodes (no UI).
- * - "Reset" clears the current game.
- * - Q-table persisted to ttt_qtable.ser (auto-save on exit).
+ * TTT_RL: Tic-Tac-Toe with a tabular Q-learning agent (O) vs human (X),
+ * now with a training progress bar and percentage display.
+ * Modified to use self-play training for stronger play.
  */
 public class TTT_RL extends JFrame {
 
@@ -26,23 +24,27 @@ public class TTT_RL extends JFrame {
     private final JButton[] cells = new JButton[9];
     private final JLabel status = new JLabel("Human (X) vs RL (O). Your move.");
     private final JButton resetBtn = new JButton("Reset");
-    private final JButton trainBtn = new JButton("Train 50k");
+    private final JButton trainBtn = new JButton("Train…");
     private final JButton saveBtn  = new JButton("Save Q");
     private final JButton loadBtn  = new JButton("Load Q");
 
+    // Progress UI
+    private final JProgressBar progressBar = new JProgressBar(0, 100);
+    private final JLabel progressLabel = new JLabel("Idle");
+
     // ---- Game state ----
-    private char[] board = new char[9]; // 'X','O',' ' (space)
+    private final char[] board = new char[9]; // 'X','O',' ' (space)
     private boolean gameOver = false;
     private char currentPlayer = 'X';   // Human starts
 
-    // ---- RL Agent (plays 'O') ----
+    // ---- RL Agent (plays 'O' during human play) ----
     private final QLearningAgent agent = new QLearningAgent('O', 'X');
 
     public TTT_RL() {
-        super("Tic Tac Toe — Q-Learning");
+        super("Tic Tac Toe — Q-Learning (+ Progress)");
         java.util.Arrays.fill(board, ' ');
 
-        // Top bar
+        // Top bar: status + control buttons
         JPanel top = new JPanel(new BorderLayout(8,8));
         status.setBorder(BorderFactory.createEmptyBorder(6,10,6,10));
         top.add(status, BorderLayout.CENTER);
@@ -55,12 +57,12 @@ public class TTT_RL extends JFrame {
         top.add(buttons, BorderLayout.EAST);
 
         resetBtn.addActionListener(e -> resetGame());
-        trainBtn.addActionListener(e -> trainAndToast());
+        trainBtn.addActionListener(e -> promptAndStartTraining());
         saveBtn.addActionListener(e -> saveQ());
         loadBtn.addActionListener(e -> loadQ());
 
-        // Grid
-        JPanel grid = new JPanel(new java.awt.GridLayout(3,3,6,6));
+        // Board grid
+        JPanel grid = new JPanel(new GridLayout(3,3,6,6));
         grid.setBorder(BorderFactory.createEmptyBorder(10,10,10,10));
         Font big = new Font(Font.SANS_SERIF, Font.BOLD, 42);
         for (int i = 0; i < 9; i++) {
@@ -74,18 +76,27 @@ public class TTT_RL extends JFrame {
             grid.add(b);
         }
 
+        // Bottom: progress bar + label
+        JPanel bottom = new JPanel(new BorderLayout(8,8));
+        progressBar.setStringPainted(true);
+        bottom.setBorder(BorderFactory.createEmptyBorder(6,10,10,10));
+        bottom.add(progressLabel, BorderLayout.WEST);
+        bottom.add(progressBar, BorderLayout.CENTER);
+
+        // Frame layout
         setLayout(new BorderLayout());
         add(top, BorderLayout.NORTH);
         add(grid, BorderLayout.CENTER);
+        add(bottom, BorderLayout.SOUTH);
 
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        setSize(420, 500);
+        setSize(460, 540);
         setLocationRelativeTo(null);
         setVisible(true);
 
-        // Try loading existing Q-table
-        loadQ(); // ignore if file absent
-        // On close, persist learned Q
+        // Try loading existing Q-table silently
+        loadQ();
+        // Persist Q on window close
         addWindowListener(new WindowAdapter() {
             public void windowClosing(WindowEvent e) { saveQ(); }
         });
@@ -156,12 +167,78 @@ public class TTT_RL extends JFrame {
         status.setText("Human (X) vs RL (O). Your move.");
     }
 
-    /* ====== Training (self-play) ====== */
-    private void trainAndToast() {
-        int episodes = 50_000;
-        agent.trainSelfPlay(episodes);
-        JOptionPane.showMessageDialog(this, "Training complete: " + episodes + " episodes.");
-        resetGame();
+    /* ====== Training (non-blocking with progress bar) ====== */
+    private void promptAndStartTraining() {
+        String input = JOptionPane.showInputDialog(this, "Episodes to train:", "50000");
+        if (input == null) return; // cancelled
+        int episodes;
+        try {
+            episodes = Math.max(1, Integer.parseInt(input.trim()));
+        } catch (NumberFormatException ex) {
+            JOptionPane.showMessageDialog(this, "Please enter a valid integer.", "Invalid Input", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        startTrainingWorker(episodes);
+    }
+
+    private void setTrainingUIEnabled(boolean enabled) {
+        trainBtn.setEnabled(enabled);
+        resetBtn.setEnabled(enabled);
+        saveBtn.setEnabled(enabled);
+        loadBtn.setEnabled(enabled);
+        for (JButton b : cells) b.setEnabled(enabled); // prevent clicks during training
+    }
+
+    private void startTrainingWorker(int episodes) {
+        setTrainingUIEnabled(false);
+        progressBar.setValue(0);
+        progressLabel.setText("Training… 0/" + episodes);
+        status.setText("Training in progress. Please wait…");
+
+        SwingWorker<Void, Integer> worker = new SwingWorker<>() {
+            @Override
+            protected Void doInBackground() {
+                // Train in small batches to keep UI responsive
+                final int reportEvery = Math.max(1, episodes / 200); // ~200 progress updates
+                for (int i = 1; i <= episodes; i++) {
+                    // >>> self-play, stronger training <<<
+                    agent.trainSelfPlaySmartOneEpisode();
+
+                    if (i % reportEvery == 0 || i == episodes) {
+                        int percent = (int) Math.round(i * 100.0 / episodes);
+                        setProgress(percent);       // updates progressBar because we bind it below
+                        publish(i);                 // send current episode count for label
+                    }
+                }
+                return null;
+            }
+
+            @Override
+            protected void process(java.util.List<Integer> chunks) {
+                // Update label with the most recent value
+                int done = chunks.get(chunks.size() - 1);
+                progressLabel.setText("Training… " + done + "/" + episodes);
+            }
+
+            @Override
+            protected void done() {
+                setTrainingUIEnabled(true);
+                progressLabel.setText("Done (" + episodes + " episodes).");
+                status.setText("Training complete. Human (X) vs RL (O). Your move.");
+                resetGame(); // start fresh with learned policy
+                JOptionPane.showMessageDialog(TTT_RL.this, "Training complete: " + episodes + " episodes.");
+            }
+        };
+
+        // Bind progress property to the progress bar
+        worker.addPropertyChangeListener(evt -> {
+            if ("progress".equals(evt.getPropertyName())) {
+                int p = (Integer) evt.getNewValue();
+                progressBar.setValue(p);
+            }
+        });
+
+        worker.execute();
     }
 
     private void saveQ() {
@@ -176,7 +253,7 @@ public class TTT_RL extends JFrame {
     private void loadQ() {
         try {
             agent.loadFrom("ttt_qtable.ser");
-            status.setText("Loaded Q-table. Human (X) vs RL (O).");
+            status.setText("Loaded Q-table. Human (X) vs RL (O). Your move.");
         } catch (Exception ignored) {}
     }
 
@@ -216,8 +293,8 @@ public class TTT_RL extends JFrame {
     static class QLearningAgent implements Serializable {
         private static final long serialVersionUID = 1L;
 
-        private final char me;
-        private final char opp;
+        private final char me;   // used for human play (agent as 'O')
+        private final char opp;  // used for human play (human as 'X')
         private double alpha = 0.5;
         private double gamma = 0.9;
         private double epsilon = 0.2;
@@ -245,58 +322,121 @@ public class TTT_RL extends JFrame {
             return best;
         }
 
-        void trainSelfPlay(int episodes) {
-            for (int ep = 0; ep < episodes; ep++) {
-                char[] b = new char[9];
-                java.util.Arrays.fill(b, ' ');
-                char cur = 'X';
+        /** Old trainer: random X vs agent as O (kept for reference). */
+        void trainOneEpisode() {
+            char[] b = new char[9];
+            java.util.Arrays.fill(b, ' ');
+            char cur = 'X';
 
-                String s = stringify(b);
-                Integer aO = null;
-                String sO = null;
+            String sO = null;
+            Integer aO = null;
 
-                while (true) {
-                    if (cur == 'X') {
-                        java.util.List<Integer> legal = legalActions(b);
-                        if (legal.isEmpty()) break;
-                        int a = legal.get(rnd.nextInt(legal.size()));
-                        b[a] = 'X';
-                        cur = 'O';
-                    } else {
-                        java.util.List<Integer> legal = legalActions(b);
-                        if (legal.isEmpty()) break;
+            while (true) {
+                if (cur == 'X') {
+                    // Random opponent move
+                    java.util.List<Integer> legal = legalActions(b);
+                    if (legal.isEmpty()) break;
+                    int a = legal.get(rnd.nextInt(legal.size()));
+                    b[a] = 'X';
+                    cur = 'O';
+                } else { // cur == 'O' (the agent)
+                    java.util.List<Integer> legal = legalActions(b);
+                    if (legal.isEmpty()) break;
 
-                        s = stringify(b);
-                        int a = chooseAction(s, legal, -1);
-                        b[a] = me;
+                    String s = stringify(b);
+                    int a = chooseAction(s, legal, -1); // use agent.epsilon
+                    b[a] = me;
 
-                        sO = s;
-                        aO = a;
-                        cur = 'X';
-                    }
+                    sO = s;
+                    aO = a;
 
-                    Character w = winnerOf(b);
-                    if (w != null || isDraw(b)) {
-                        double r;
-                        if (w == null) r = 0.0;
-                        else if (w == me) r = +1.0;
-                        else r = -1.0;
-
-                        if (sO != null && aO != null) {
-                            updateQTerminal(sO, aO, r);
-                        }
-                        break;
-                    }
-
-                    if (sO != null && aO != null && cur == 'X') {
-                        String sPrime = stringify(b);
-                        updateQ(sO, aO, 0.0, sPrime);
-                        sO = null; aO = null;
-                    }
+                    cur = 'X';
                 }
 
-                if ((ep+1) % 5000 == 0) epsilon = Math.max(0.05, epsilon * 0.9);
+                Character w = winnerOf(b);
+                if (w != null || isDraw(b)) {
+                    double r;
+                    if (w == null) r = 0.0;
+                    else if (w == me) r = +1.0;
+                    else r = -1.0;
+
+                    if (sO != null && aO != null) {
+                        updateQTerminal(sO, aO, r);
+                    }
+                    break;
+                }
+
+                // After our move (now X's turn) -> intermediate update
+                if (sO != null && aO != null && cur == 'X') {
+                    String sPrime = stringify(b);
+                    updateQ(sO, aO, 0.0, sPrime);
+                    sO = null; aO = null;
+                }
             }
+
+            // Mild epsilon decay each episode for convergence
+            epsilon = Math.max(0.05, epsilon * 0.99995);
+        }
+
+        /** NEW: Self-play episode where the SAME Q-table plays both X and O.
+         * We update the mover's last (s,a) with bootstrap/terminal rewards from that mover's perspective.
+         * This tends to converge to optimal (never-losing) play.
+         */
+        void trainSelfPlaySmartOneEpisode() {
+            char[] b = new char[9];
+            java.util.Arrays.fill(b, ' ');
+            char cur = 'X';
+
+            // Track the last (state, action) for EACH side separately
+            String sPrevX = null, sPrevO = null;
+            Integer aPrevX = null, aPrevO = null;
+
+            while (true) {
+                java.util.List<Integer> legal = legalActions(b);
+                if (legal.isEmpty()) break;
+
+                String s = stringify(b);
+                int a = chooseAction(s, legal, -1); // ε-greedy using this.epsilon
+                b[a] = cur;
+
+                // After a move, check terminal
+                Character w = winnerOf(b);
+                boolean terminal = (w != null) || isDraw(b);
+
+                // Who just moved? Update that player's previous step (bootstrap) if exists
+                if (cur == 'X') {
+                    if (sPrevX != null && aPrevX != null && !terminal) {
+                        String sPrime = stringify(b);
+                        updateQ(sPrevX, aPrevX, 0.0, sPrime);
+                    }
+                    sPrevX = s; aPrevX = a;
+                } else { // cur == 'O'
+                    if (sPrevO != null && aPrevO != null && !terminal) {
+                        String sPrime = stringify(b);
+                        updateQ(sPrevO, aPrevO, 0.0, sPrime);
+                    }
+                    sPrevO = s; aPrevO = a;
+                }
+
+                if (terminal) {
+                    // Terminal rewards from each player's perspective
+                    double rX = 0.0, rO = 0.0;
+                    if (w != null) {
+                        if (w == 'X') { rX = +1.0; rO = -1.0; }
+                        else          { rX = -1.0; rO = +1.0; }
+                    } // draw stays 0/0
+
+                    if (sPrevX != null && aPrevX != null) updateQTerminal(sPrevX, aPrevX, rX);
+                    if (sPrevO != null && aPrevO != null) updateQTerminal(sPrevO, aPrevO, rO);
+                    break;
+                }
+
+                // Switch player
+                cur = (cur == 'X') ? 'O' : 'X';
+            }
+
+            // Mild epsilon decay
+            epsilon = Math.max(0.05, epsilon * 0.99995);
         }
 
         private void updateQ(String s, int a, double r, String sPrime) {
