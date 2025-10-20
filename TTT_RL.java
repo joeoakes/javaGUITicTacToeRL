@@ -14,9 +14,10 @@ import java.util.Map;
 import java.util.Random;
 
 /**
- * TTT_RL: Tic-Tac-Toe with a tabular Q-learning agent (O) vs human (X),
- * now with a training progress bar and percentage display.
- * Modified to use self-play training for stronger play.
+ * TTT_RL: Tic-Tac-Toe with a tabular Q-learning agent and GUI.
+ * - Training progress bar + percentage
+ * - Training mode selector: Self-Play (strong) OR Random X vs Agent O (legacy)
+ * - "Human plays O" toggle (lets AI start as X)
  */
 public class TTT_RL extends JFrame {
 
@@ -28,6 +29,13 @@ public class TTT_RL extends JFrame {
     private final JButton saveBtn  = new JButton("Save Q");
     private final JButton loadBtn  = new JButton("Load Q");
 
+    // New controls
+    private final JComboBox<String> trainModeCombo = new JComboBox<>(new String[]{
+            "Self-Play (strong)",
+            "Random X vs Agent O (legacy)"
+    });
+    private final JCheckBox playAsOCheck = new JCheckBox("Human plays O");
+
     // Progress UI
     private final JProgressBar progressBar = new JProgressBar(0, 100);
     private final JLabel progressLabel = new JLabel("Idle");
@@ -35,31 +43,56 @@ public class TTT_RL extends JFrame {
     // ---- Game state ----
     private final char[] board = new char[9]; // 'X','O',' ' (space)
     private boolean gameOver = false;
-    private char currentPlayer = 'X';   // Human starts
 
-    // ---- RL Agent (plays 'O' during human play) ----
+    // Who is who for LIVE PLAY (not training)
+    private char humanMark = 'X';
+    private char aiMark    = 'O';
+    private char currentPlayer = 'X';   // X always starts the actual game
+
+    // ---- RL Agent (Q-table lives here) ----
     private final QLearningAgent agent = new QLearningAgent('O', 'X');
 
     public TTT_RL() {
-        super("Tic Tac Toe — Q-Learning (+ Progress)");
+        super("Tic Tac Toe — Q-Learning (+ Modes & Sides)");
         java.util.Arrays.fill(board, ' ');
 
-        // Top bar: status + control buttons
+        // Top bar: status + control buttons + mode/side controls
         JPanel top = new JPanel(new BorderLayout(8,8));
         status.setBorder(BorderFactory.createEmptyBorder(6,10,6,10));
         top.add(status, BorderLayout.CENTER);
 
-        JPanel buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 6));
-        buttons.add(resetBtn);
-        buttons.add(trainBtn);
-        buttons.add(saveBtn);
-        buttons.add(loadBtn);
-        top.add(buttons, BorderLayout.EAST);
+        JPanel controlsLeft = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 6));
+        controlsLeft.add(new JLabel("Train Mode:"));
+        controlsLeft.add(trainModeCombo);
+        controlsLeft.add(playAsOCheck);
+        top.add(controlsLeft, BorderLayout.WEST);
 
-        resetBtn.addActionListener(e -> resetGame());
+        JPanel controlsRight = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 6));
+        controlsRight.add(resetBtn);
+        controlsRight.add(trainBtn);
+        controlsRight.add(saveBtn);
+        controlsRight.add(loadBtn);
+        top.add(controlsRight, BorderLayout.EAST);
+
+        // Events
+        resetBtn.addActionListener(e -> {
+            resetGame();
+            // If human plays O, AI (X) opens
+            maybeAgentAutoOpen();
+        });
         trainBtn.addActionListener(e -> promptAndStartTraining());
         saveBtn.addActionListener(e -> saveQ());
-        loadBtn.addActionListener(e -> loadQ());
+        loadBtn.addActionListener(e -> {
+            loadQ();
+            // keep status consistent with current side
+            updateStatusForTurn();
+        });
+        playAsOCheck.addActionListener(e -> {
+            humanMark = playAsOCheck.isSelected() ? 'O' : 'X';
+            aiMark    = (humanMark == 'X') ? 'O' : 'X';
+            resetGame();
+            maybeAgentAutoOpen();
+        });
 
         // Board grid
         JPanel grid = new JPanel(new GridLayout(3,3,6,6));
@@ -90,7 +123,7 @@ public class TTT_RL extends JFrame {
         add(bottom, BorderLayout.SOUTH);
 
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        setSize(460, 540);
+        setSize(520, 560);
         setLocationRelativeTo(null);
         setVisible(true);
 
@@ -100,27 +133,32 @@ public class TTT_RL extends JFrame {
         addWindowListener(new WindowAdapter() {
             public void windowClosing(WindowEvent e) { saveQ(); }
         });
+
+        // Initial side + opening move if needed
+        humanMark = 'X';
+        aiMark    = 'O';
+        updateStatusForTurn();
     }
 
-    /* ====== Human turn ====== */
+    /* ====== Human turn (LIVE PLAY) ====== */
     private void humanMove(int idx) {
-        if (gameOver || currentPlayer != 'X') return;
+        if (gameOver || currentPlayer != humanMark) return;
         if (board[idx] != ' ') return;
 
-        applyMove(idx, 'X');
+        applyMove(idx, humanMark);
         if (checkEndAndReport()) return;
 
-        // Agent (O) replies immediately
-        agentMove();
+        // Agent replies if it's AI's turn now
+        agentMoveIfAITurn();
     }
 
-    /* ====== Agent turn (ε-greedy on the current board) ====== */
-    private void agentMove() {
-        if (gameOver || currentPlayer != 'O') return;
+    /* ====== Agent turn (LIVE PLAY, ε=0 exploit) ====== */
+    private void agentMoveIfAITurn() {
+        if (gameOver || currentPlayer != aiMark) return;
 
         String state = stringify(board);
-        int action = agent.chooseAction(state, legalActions(board), /*epsilon=*/0.0); // exploit at play-time
-        applyMove(action, 'O');
+        int action = agent.chooseAction(state, legalActions(board), /*epsilon=*/0.0); // exploit only
+        applyMove(action, aiMark);
         checkEndAndReport();
     }
 
@@ -129,6 +167,18 @@ public class TTT_RL extends JFrame {
         board[idx] = p;
         cells[idx].setText(String.valueOf(p));
         currentPlayer = (p == 'X') ? 'O' : 'X';
+        updateStatusForTurn();
+    }
+
+    private void updateStatusForTurn() {
+        if (gameOver) return;
+        String humanSide = (humanMark == 'X') ? "X" : "O";
+        String aiSide    = (aiMark == 'X') ? "X" : "O";
+        if (currentPlayer == humanMark) {
+            status.setText("Human (" + humanSide + ") vs RL (" + aiSide + "). Your move.");
+        } else {
+            status.setText("Human (" + humanSide + ") vs RL (" + aiSide + "). RL thinking...");
+        }
     }
 
     /* Win/draw detection + status UI */
@@ -136,7 +186,8 @@ public class TTT_RL extends JFrame {
         Character winner = winnerOf(board);
         if (winner != null) {
             gameOver = true;
-            status.setText((winner == 'X' ? "Human (X)" : "RL (O)") + " wins!");
+            boolean humanWon = (winner == humanMark);
+            status.setText((humanWon ? "Human (" : "RL (") + winner + ") wins!");
             highlightWin(winner);
             return true;
         }
@@ -145,7 +196,6 @@ public class TTT_RL extends JFrame {
             status.setText("Draw.");
             return true;
         }
-        status.setText(currentPlayer == 'X' ? "Your move (X)" : "RL thinking (O)...");
         return false;
     }
 
@@ -162,9 +212,16 @@ public class TTT_RL extends JFrame {
     private void resetGame() {
         java.util.Arrays.fill(board, ' ');
         for (JButton b : cells) { b.setText(""); b.setBackground(Color.WHITE); }
-        currentPlayer = 'X';
+        currentPlayer = 'X';          // X always opens
         gameOver = false;
-        status.setText("Human (X) vs RL (O). Your move.");
+        updateStatusForTurn();
+    }
+
+    private void maybeAgentAutoOpen() {
+        // If human is O, AI is X and should open with one move
+        if (!gameOver && humanMark == 'O' && currentPlayer == 'X') {
+            agentMoveIfAITurn();
+        }
     }
 
     /* ====== Training (non-blocking with progress bar) ====== */
@@ -186,6 +243,8 @@ public class TTT_RL extends JFrame {
         resetBtn.setEnabled(enabled);
         saveBtn.setEnabled(enabled);
         loadBtn.setEnabled(enabled);
+        trainModeCombo.setEnabled(enabled);
+        playAsOCheck.setEnabled(enabled);
         for (JButton b : cells) b.setEnabled(enabled); // prevent clicks during training
     }
 
@@ -195,14 +254,20 @@ public class TTT_RL extends JFrame {
         progressLabel.setText("Training… 0/" + episodes);
         status.setText("Training in progress. Please wait…");
 
+        final String selectedMode = (String) trainModeCombo.getSelectedItem();
+
         SwingWorker<Void, Integer> worker = new SwingWorker<>() {
             @Override
             protected Void doInBackground() {
                 // Train in small batches to keep UI responsive
                 final int reportEvery = Math.max(1, episodes / 200); // ~200 progress updates
                 for (int i = 1; i <= episodes; i++) {
-                    // >>> self-play, stronger training <<<
-                    agent.trainSelfPlaySmartOneEpisode();
+
+                    if ("Self-Play (strong)".equals(selectedMode)) {
+                        agent.trainSelfPlaySmartOneEpisode();
+                    } else {
+                        agent.trainOneEpisode(); // Random X vs Agent O (legacy)
+                    }
 
                     if (i % reportEvery == 0 || i == episodes) {
                         int percent = (int) Math.round(i * 100.0 / episodes);
@@ -215,7 +280,6 @@ public class TTT_RL extends JFrame {
 
             @Override
             protected void process(java.util.List<Integer> chunks) {
-                // Update label with the most recent value
                 int done = chunks.get(chunks.size() - 1);
                 progressLabel.setText("Training… " + done + "/" + episodes);
             }
@@ -224,8 +288,9 @@ public class TTT_RL extends JFrame {
             protected void done() {
                 setTrainingUIEnabled(true);
                 progressLabel.setText("Done (" + episodes + " episodes).");
-                status.setText("Training complete. Human (X) vs RL (O). Your move.");
-                resetGame(); // start fresh with learned policy
+                status.setText("Training complete.");
+                resetGame();            // start fresh with learned policy
+                maybeAgentAutoOpen();   // if AI is X, it will open
                 JOptionPane.showMessageDialog(TTT_RL.this, "Training complete: " + episodes + " episodes.");
             }
         };
@@ -253,7 +318,7 @@ public class TTT_RL extends JFrame {
     private void loadQ() {
         try {
             agent.loadFrom("ttt_qtable.ser");
-            status.setText("Loaded Q-table. Human (X) vs RL (O). Your move.");
+            status.setText("Loaded Q-table.");
         } catch (Exception ignored) {}
     }
 
@@ -293,8 +358,10 @@ public class TTT_RL extends JFrame {
     static class QLearningAgent implements Serializable {
         private static final long serialVersionUID = 1L;
 
-        private final char me;   // used for human play (agent as 'O')
-        private final char opp;  // used for human play (human as 'X')
+        // 'me' & 'opp' are kept for historical usage (human-play context),
+        // training methods below ignore these and learn both sides.
+        private final char me;
+        private final char opp;
         private double alpha = 0.5;
         private double gamma = 0.9;
         private double epsilon = 0.2;
@@ -322,7 +389,7 @@ public class TTT_RL extends JFrame {
             return best;
         }
 
-        /** Old trainer: random X vs agent as O (kept for reference). */
+        /** Legacy trainer: random X vs agent as O (kept for comparison). */
         void trainOneEpisode() {
             char[] b = new char[9];
             java.util.Arrays.fill(b, ' ');
@@ -345,7 +412,7 @@ public class TTT_RL extends JFrame {
 
                     String s = stringify(b);
                     int a = chooseAction(s, legal, -1); // use agent.epsilon
-                    b[a] = me;
+                    b[a] = 'O';
 
                     sO = s;
                     aO = a;
@@ -357,7 +424,7 @@ public class TTT_RL extends JFrame {
                 if (w != null || isDraw(b)) {
                     double r;
                     if (w == null) r = 0.0;
-                    else if (w == me) r = +1.0;
+                    else if (w == 'O') r = +1.0;
                     else r = -1.0;
 
                     if (sO != null && aO != null) {
@@ -378,10 +445,7 @@ public class TTT_RL extends JFrame {
             epsilon = Math.max(0.05, epsilon * 0.99995);
         }
 
-        /** NEW: Self-play episode where the SAME Q-table plays both X and O.
-         * We update the mover's last (s,a) with bootstrap/terminal rewards from that mover's perspective.
-         * This tends to converge to optimal (never-losing) play.
-         */
+        /** Self-play trainer: SAME Q-table plays both X and O. */
         void trainSelfPlaySmartOneEpisode() {
             char[] b = new char[9];
             java.util.Arrays.fill(b, ' ');
@@ -399,11 +463,11 @@ public class TTT_RL extends JFrame {
                 int a = chooseAction(s, legal, -1); // ε-greedy using this.epsilon
                 b[a] = cur;
 
-                // After a move, check terminal
+                // After the move, check terminal
                 Character w = winnerOf(b);
                 boolean terminal = (w != null) || isDraw(b);
 
-                // Who just moved? Update that player's previous step (bootstrap) if exists
+                // Mover's intermediate bootstrap update
                 if (cur == 'X') {
                     if (sPrevX != null && aPrevX != null && !terminal) {
                         String sPrime = stringify(b);
